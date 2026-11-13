@@ -12,7 +12,9 @@ import pytest
 
 import cwt
 from cwt import Claims, COSEKey
+from cwt.cose import COSE
 from cwt.cose_key_interface import COSEKeyInterface
+from cwt.recipient import Recipient
 from cwt.enums import (
     COSEAlgs,
     COSEKeyCrvs,
@@ -722,5 +724,260 @@ class TestCOSEKey:
                     "alg": invalid,
                 }
             )
+            pytest.fail("from_jwk should fail.")
+        assert msg in str(err.value)
+
+
+class TestCOSEKeyFromJWKUseKeyOpsMapping:
+    """
+    Tests for the use/key_ops to COSE key_ops mapping in COSEKey.from_jwk.
+
+    The "use" member of a JWK implies an envelope of COSE key operations
+    which is decided by the key type and the algorithm. An explicit
+    "key_ops" member can only narrow that envelope; operations outside of
+    it are rejected as a conflict.
+    """
+
+    def test_from_jwk_use_enc_symmetric_cek_round_trip(self):
+        # For a content-encryption algorithm, use="enc" grants both
+        # encrypt(3) and decrypt(4) decided by the algorithm.
+        key = COSEKey.from_jwk(
+            {
+                "kty": "oct",
+                "alg": "A128GCM",
+                "kid": "our-secret",
+                "use": "enc",
+                "k": "hJtXIZ2uSN5kbQfbtTNWbg",
+            }
+        )
+        assert key.key_ops == [3, 4]
+        token = cwt.encode_and_encrypt(Claims.from_json({"iss": "coaps://as.example"}), key)
+        decoded = cwt.decode(token, key)
+        assert CWTClaims.ISS in decoded and decoded[CWTClaims.ISS] == "coaps://as.example"
+
+    def test_from_jwk_use_enc_symmetric_cek_with_key_ops_narrowing(self):
+        # The caller can explicitly restrict the use="enc" envelope [3, 4]
+        # to decrypt(4) only.
+        enc_key = COSEKey.from_jwk(
+            {
+                "kty": "oct",
+                "alg": "A128GCM",
+                "kid": "our-secret",
+                "use": "enc",
+                "k": "hJtXIZ2uSN5kbQfbtTNWbg",
+            }
+        )
+        dec_key = COSEKey.from_jwk(
+            {
+                "kty": "oct",
+                "alg": "A128GCM",
+                "kid": "our-secret",
+                "use": "enc",
+                "key_ops": ["decrypt"],
+                "k": "hJtXIZ2uSN5kbQfbtTNWbg",
+            }
+        )
+        assert dec_key.key_ops == [4]
+        token = cwt.encode_and_encrypt(Claims.from_json({"iss": "coaps://as.example"}), enc_key)
+        decoded = cwt.decode(token, dec_key)
+        assert CWTClaims.ISS in decoded and decoded[CWTClaims.ISS] == "coaps://as.example"
+        # The decrypt-only key cannot be used for encryption.
+        with pytest.raises(ValueError) as err:
+            cwt.encode(Claims.from_json({"iss": "coaps://as.example"}), dec_key)
+            pytest.fail("cwt.encode should fail.")
+        assert "The key operation could not be specified." in str(err.value)
+
+    def test_from_jwk_use_enc_symmetric_key_wrap_round_trip(self):
+        # For a key wrap algorithm, use="enc" is mapped to
+        # wrapKey(5)/unwrapKey(6) decided by the algorithm.
+        key = COSEKey.from_jwk(
+            {
+                "kty": "oct",
+                "alg": "A128KW",
+                "kid": "our-secret",
+                "use": "enc",
+                "k": "hJtXIZ2uSN5kbQfbtTNWbg",
+            }
+        )
+        assert key.key_ops == [5, 6]
+        cek = b"0123456789abcdef"
+        assert key.unwrap_key(key.wrap_key(cek)) == cek
+
+    def test_from_jwk_use_sig_symmetric_mac_round_trip(self):
+        # For a MAC algorithm, use="sig" grants both MAC create(9) and
+        # MAC verify(10) decided by the algorithm.
+        with open(key_path("hs256.json")) as key_file:
+            key = COSEKey.from_jwk(key_file.read())
+        assert key.key_ops == [9, 10]
+        token = cwt.encode_and_mac(Claims.from_json({"iss": "coaps://as.example"}), key)
+        decoded = cwt.decode(token, key)
+        assert CWTClaims.ISS in decoded and decoded[CWTClaims.ISS] == "coaps://as.example"
+
+    def test_from_jwk_use_enc_ec2_key_agreement_round_trip(self):
+        # For an EC key with an ECDH algorithm, use="enc" is mapped to key
+        # agreement: deriveKey(7)/deriveBits(8) for the private key, and no
+        # key_ops for the public key.
+        recipient_priv_key = COSEKey.from_jwk(
+            {
+                "kty": "EC",
+                "alg": "ECDH-ES+HKDF-256",
+                "crv": "P-256",
+                "kid": "01",
+                "use": "enc",
+                "x": "Ze2loSV3wrroKUN_4zhwGhCqo3Xhu1td4QjeQ5wIVR0",
+                "y": "HlLtdXARY_f55A3fnzQbPcm6hgr34Mp8p-nuzQCE0Zw",
+                "d": "r_kHyZ-a06rmxM3yESK84r1otSg-aQcVStkRhA-iCM8",
+            }
+        )
+        recipient_pub_key = COSEKey.from_jwk(
+            {
+                "kty": "EC",
+                "alg": "ECDH-ES+HKDF-256",
+                "crv": "P-256",
+                "kid": "01",
+                "use": "enc",
+                "x": "Ze2loSV3wrroKUN_4zhwGhCqo3Xhu1td4QjeQ5wIVR0",
+                "y": "HlLtdXARY_f55A3fnzQbPcm6hgr34Mp8p-nuzQCE0Zw",
+            }
+        )
+        assert recipient_priv_key.key_ops == [7, 8]
+        assert recipient_pub_key.key_ops == []
+        rec = Recipient.new(
+            unprotected={"alg": "ECDH-ES+HKDF-256"},
+            recipient_key=recipient_pub_key,
+            context={"alg": "A128GCM"},
+        )
+        ctx = COSE.new(alg_auto_inclusion=True)
+        encoded = ctx.encode_and_encrypt(b"Hello world!", recipients=[rec])
+        assert ctx.decode(encoded, recipient_priv_key, context={"alg": "A128GCM"}) == b"Hello world!"
+
+    def test_from_jwk_use_enc_okp_key_agreement_round_trip(self):
+        # Same as above but with an X25519 (OKP) key pair.
+        recipient_priv_key = COSEKey.from_jwk(
+            {
+                "kty": "OKP",
+                "alg": "ECDH-SS+HKDF-256",
+                "crv": "X25519",
+                "kid": "01",
+                "use": "enc",
+                "x": "y3wJq3uXPHeoCO4FubvTc7VcBuqpvUrSvU6ZMbHDTCI",
+                "d": "vsJ1oX5NNi0IGdwGldiac75r-Utmq3Jq4LGv48Q_Qc4",
+            }
+        )
+        recipient_pub_key = COSEKey.from_jwk(
+            {
+                "kty": "OKP",
+                "alg": "ECDH-SS+HKDF-256",
+                "crv": "X25519",
+                "kid": "01",
+                "use": "enc",
+                "x": "y3wJq3uXPHeoCO4FubvTc7VcBuqpvUrSvU6ZMbHDTCI",
+            }
+        )
+        sender_priv_key = COSEKey.from_jwk(
+            {
+                "kty": "OKP",
+                "alg": "ECDH-SS+HKDF-256",
+                "crv": "X25519",
+                "kid": "02",
+                "use": "enc",
+                "x": "Xmb6v-_AshhiZLc6Qd12XFuiq0XmxnYl4ozBq7tHCWc",
+                "d": "cDCuVLIyn0pEOG2GuMts4A1mCGXy8YIxTfZOilDOGFA",
+            }
+        )
+        assert recipient_priv_key.key_ops == [7, 8]
+        assert recipient_pub_key.key_ops == []
+        assert sender_priv_key.key_ops == [7, 8]
+        rec = Recipient.new(
+            unprotected={"alg": "ECDH-SS+HKDF-256"},
+            sender_key=sender_priv_key,
+            recipient_key=recipient_pub_key,
+            context={"alg": "A128GCM"},
+        )
+        ctx = COSE.new(alg_auto_inclusion=True)
+        encoded = ctx.encode_and_encrypt(b"Hello world!", recipients=[rec])
+        assert ctx.decode(encoded, recipient_priv_key, context={"alg": "A128GCM"}) == b"Hello world!"
+
+    @pytest.mark.parametrize(
+        "invalid, msg",
+        [
+            # RSA keys only support signature algorithms in this library.
+            (
+                {
+                    "kty": "RSA",
+                    "alg": "RS256",
+                    "use": "enc",
+                    "n": "o4hWSF-rtXeKI8J32sX3agnJZMyprxQWdmfkaL3jsLK13Yelk7ChlaKIPWU0GHU7Wh_Ce3aslUIb7KsU51Fo3olAVBVszjTYZFu5IIgKtZoni-r8NVHqcmT6JLGhoVGVRaPjEGudmCtxocgiWXGHucl14DChV6PAcPlcbcosNmeJ5z6ia8lp5det-KkjFTe0-EdWB2kTzZvEmbotbtPL-B0BH_jYqmmZWgCU_TZ76QgORiOPmN-GW5RrLOEkay-f-Sx6XGTZxC_heN6eT-Ql1KgGQnagRDOAmcKy4CJp2vmODR8LbOyZl22C8x5wR5Vzz-9NE_WIF0nHT1ivIFOOZQ",
+                    "e": "AQAB",
+                },
+                "use: enc is not applicable for the key.",
+            ),
+            # An Ed25519 key cannot be used for encryption/key agreement.
+            (
+                {
+                    "kty": "OKP",
+                    "crv": "Ed25519",
+                    "use": "enc",
+                    "x": "2E6dX83gqD_D0eAmqnaHe1TC1xuld6iAKXfw2OVATr0",
+                    "d": "L8JS08VsFZoZxGa9JvzYmCWOwg7zaKcei3KZmYsj7dc",
+                },
+                "use: enc is not applicable for the key.",
+            ),
+            # An EC key bound to a signature algorithm cannot be used for
+            # encryption/key agreement.
+            (
+                {
+                    "kty": "EC",
+                    "crv": "P-256",
+                    "alg": "ES256",
+                    "use": "enc",
+                    "x": "usWxHK2PmfnHKwXPS54m0kTcGJ90UiglWiGahtagnv8",
+                    "y": "IBOL-C3BttVivg-lSreASjpkttcsz-1rb7btKLv8EX4",
+                    "d": "V8kgd2ZBRuh2dgyVINBUqpPDr7BOMGcF22CQMIUHtNM",
+                },
+                "use: enc is not applicable for the key.",
+            ),
+            # A MAC key cannot be used for encryption.
+            (
+                {"kty": "oct", "alg": "HS256", "use": "enc", "k": "hJtXIZ2uSN5kbQfbtTNWbg"},
+                "use: enc is not applicable for the key.",
+            ),
+            # A content-encryption key cannot be used for signing.
+            (
+                {"kty": "oct", "alg": "A128GCM", "use": "sig", "k": "hJtXIZ2uSN5kbQfbtTNWbg"},
+                "use: sig is not applicable for the key.",
+            ),
+            # key_ops outside of the use="enc" envelope are rejected
+            # instead of being granted for compatibility.
+            (
+                {"kty": "oct", "alg": "A128GCM", "use": "enc", "key_ops": ["sign"], "k": "hJtXIZ2uSN5kbQfbtTNWbg"},
+                "use and key_ops are conflicted each other.",
+            ),
+            (
+                {
+                    "kty": "oct",
+                    "alg": "A128GCM",
+                    "use": "enc",
+                    "key_ops": ["encrypt", "wrapKey"],
+                    "k": "hJtXIZ2uSN5kbQfbtTNWbg",
+                },
+                "use and key_ops are conflicted each other.",
+            ),
+            (
+                {
+                    "kty": "RSA",
+                    "alg": "RS256",
+                    "use": "enc",
+                    "key_ops": ["encrypt"],
+                    "n": "o4hWSF-rtXeKI8J32sX3agnJZMyprxQWdmfkaL3jsLK13Yelk7ChlaKIPWU0GHU7Wh_Ce3aslUIb7KsU51Fo3olAVBVszjTYZFu5IIgKtZoni-r8NVHqcmT6JLGhoVGVRaPjEGudmCtxocgiWXGHucl14DChV6PAcPlcbcosNmeJ5z6ia8lp5det-KkjFTe0-EdWB2kTzZvEmbotbtPL-B0BH_jYqmmZWgCU_TZ76QgORiOPmN-GW5RrLOEkay-f-Sx6XGTZxC_heN6eT-Ql1KgGQnagRDOAmcKy4CJp2vmODR8LbOyZl22C8x5wR5Vzz-9NE_WIF0nHT1ivIFOOZQ",
+                    "e": "AQAB",
+                },
+                "use and key_ops are conflicted each other.",
+            ),
+        ],
+    )
+    def test_from_jwk_with_inapplicable_use_or_conflicted_key_ops(self, invalid, msg):
+        with pytest.raises(ValueError) as err:
+            COSEKey.from_jwk(invalid)
             pytest.fail("from_jwk should fail.")
         assert msg in str(err.value)

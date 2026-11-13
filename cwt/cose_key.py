@@ -196,6 +196,15 @@ class COSEKey:
         """
         Creates a COSE key from JWK (JSON Web Key).
 
+        The JWK ``use`` member is mapped to a COSE ``key_ops`` envelope
+        decided by the key type and algorithm: ``"enc"`` grants
+        encrypt/decrypt (or wrapKey/unwrapKey for key wrap algorithms) to
+        symmetric keys, and deriveKey/deriveBits to EC/OKP key agreement
+        keys; ``"sig"`` grants sign/verify (or MAC create/verify for
+        symmetric MAC keys). An explicit JWK ``key_ops`` is treated as a
+        restriction of that envelope, and combinations that fall outside
+        of it are rejected as a conflict.
+
         Args:
             jwk (str | bytes | dict[str, Any]): JWK-formatted key data.
         Returns:

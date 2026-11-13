@@ -4,6 +4,11 @@ Changes
 Unreleased
 ----------
 
+- Fix the JWK ``use``/``key_ops`` to COSE ``key_ops`` mapping in ``COSEKey.from_jwk``.
+    - Map ``use="enc"`` to an algorithm-dependent capability envelope: encrypt/decrypt for content-encryption keys, wrapKey/unwrapKey for key wrap keys, deriveKey/deriveBits for EC/OKP key agreement keys (no key_ops for public agreement keys), and reject it for signature-only keys (RSA, Ed25519, ES256, etc.) and MAC keys.
+    - Map ``use="sig"`` on symmetric MAC keys to both MAC create and MAC verify.
+    - Treat an explicit ``key_ops`` as a caller-side restriction that must stay within the ``use`` envelope; reject conflicting combinations instead of granting operations.
+
 Version 4.0.0
 -------------
 

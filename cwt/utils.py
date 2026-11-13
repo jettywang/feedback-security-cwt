@@ -8,6 +8,8 @@ import cbor2
 
 from .const import (
     COSE_ALGORITHMS_CEK,
+    COSE_ALGORITHMS_CKDM_KEY_AGREEMENT,
+    COSE_ALGORITHMS_HPKE,
     COSE_ALGORITHMS_KEY_WRAP,
     COSE_ALGORITHMS_MAC,
     COSE_ALGORITHMS_SYMMETRIC,
@@ -250,6 +252,53 @@ def to_cose_header(data: dict | ResolvedHeader | None = None, algs: dict[str, in
     return res
 
 
+def _jwk_use_to_cose_key_ops(use: str, cose_key: dict[int, Any], is_public: bool) -> list[int] | None:
+    """
+    Derives the COSE key_ops envelope implied by a JWK "use" value for a key.
+
+    Returns a list of COSE key operation values that the key can perform
+    under the given "use", or None if the "use" is not applicable to the key
+    at all. An empty list means the "use" is applicable but the key must not
+    carry key_ops (e.g. a public key for key agreement).
+    """
+    kty = cose_key[1]
+    alg = cose_key.get(3, 0)
+    if use == "enc":
+        if kty == 4:  # Symmetric
+            if alg in COSE_ALGORITHMS_KEY_WRAP.values():
+                return [
+                    5,  # wrap key
+                    6,  # unwrap key
+                ]
+            if alg in COSE_ALGORITHMS_MAC.values():
+                return None
+            return [
+                3,  # encrypt
+                4,  # decrypt
+            ]
+        if kty == 3:  # RSA (only signature algorithms are supported)
+            return None
+        # OKP/EC2: "enc" is realized through key agreement.
+        if alg:
+            if alg in COSE_ALGORITHMS_HPKE.values():
+                return [] if is_public else [8]  # 8: derive bits
+            if alg not in COSE_ALGORITHMS_CKDM_KEY_AGREEMENT.values():
+                return None
+        elif kty == 1 and cose_key[-1] not in [4, 5]:  # not X25519/X448
+            return None
+        # Public keys for key agreement should not have key_ops.
+        return [] if is_public else [7, 8]  # 7: derive key, 8: derive bits
+    # use == "sig"
+    if kty == 4:  # Symmetric
+        if alg not in COSE_ALGORITHMS_MAC.values():
+            return None
+        return [
+            9,  # MAC create
+            10,  # MAC verify
+        ]
+    return [2] if is_public else [1]  # 1: sign, 2: verify
+
+
 def jwk_to_cose_key_params(data: str | bytes | dict[str, Any]) -> dict[int, Any]:
     cose_key: dict[int, Any] = {}
 
@@ -319,17 +368,12 @@ def jwk_to_cose_key_params(data: str | bytes | dict[str, Any]) -> dict[int, Any]
             is_public = True
 
     # use/key_ops
-    use = 0
-    if "use" in jwk:
-        if jwk["use"] == "enc":
-            use = 4 if is_public else 3  # 3: encrypt, 4: decrypt
-        elif jwk["use"] == "sig":
-            if cose_key[1] == 4:
-                use = 10  # 10: MAC verify
-            else:
-                use = 2 if is_public else 1  # 1: sign, 2: verify
-        else:
-            raise ValueError(f"Unknown use: {jwk['use']}.")
+    use = jwk.get("use", "")
+    use_ops: list[int] | None = None
+    if use:
+        if use not in ["enc", "sig"]:
+            raise ValueError(f"Unknown use: {use}.")
+        use_ops = _jwk_use_to_cose_key_ops(use, cose_key, is_public)
     if "key_ops" in jwk:
         if not isinstance(jwk["key_ops"], list):
             raise ValueError("key_ops should be list.")
@@ -339,12 +383,16 @@ def jwk_to_cose_key_params(data: str | bytes | dict[str, Any]) -> dict[int, Any]
                 cose_key[4].append(JWK_OPERATIONS[ops])
         except KeyError as err:
             raise ValueError("Unsupported or unknown key_ops.") from err
-        if use != 0 and use not in cose_key[4]:
-            raise ValueError("use and key_ops are conflicted each other.")
-    else:
-        if use != 0:
-            cose_key[4] = []
-            cose_key[4].append(use)
+        # The caller can narrow the operations implied by "use" with an
+        # explicit "key_ops", but operations outside of the "use" envelope
+        # are rejected as a conflict instead of being silently granted.
+        if use:
+            if use_ops is None or not set(cose_key[4]) <= set(use_ops):
+                raise ValueError("use and key_ops are conflicted each other.")
+    elif use:
+        if use_ops is None:
+            raise ValueError(f"use: {use} is not applicable for the key.")
+        cose_key[4] = use_ops
     if "x5c" in jwk:
         if not isinstance(jwk["x5c"], list):
             raise ValueError("x5c should be a list of str.")
