@@ -68,21 +68,33 @@ class TestDuplicateMapKeys:
     def test_encrypted_cose_key_to_cose_key_with_duplicated_labels(self):
         enc_key = COSEKey.generate_symmetric_key(alg="ChaCha20/Poly1305", kid="enc")
         cose = COSE()
+        context = EncryptedCOSEKey.build_context("test/duplicate-map-keys", "enc")
 
         def encrypt(key_data: bytes) -> list:
             p = {1: enc_key.alg}
             u = {4: enc_key.kid, 5: enc_key.generate_nonce()}
-            return cose.encode_and_encrypt(key_data, enc_key, p, u, out="cbor2/CBORTag").value
+            return cose.encode_and_encrypt(
+                key_data, enc_key, p, u, external_aad=context, out="cbor2/CBORTag"
+            ).value
 
         # alg: HS256, k: b"x" * 32
         rest = dumps(3) + dumps(5) + dumps(-1) + dumps(b"x" * 32)
 
         # {1: 4, 3: 5, -1: k}: without duplicates, the key can be decrypted and decoded.
-        assert EncryptedCOSEKey.to_cose_key(encrypt(b"\xa3" + dumps(1) + dumps(4) + rest), enc_key).kty == 4
+        assert (
+            EncryptedCOSEKey.to_cose_key(
+                encrypt(b"\xa3" + dumps(1) + dumps(4) + rest), enc_key, context=context
+            ).kty
+            == 4
+        )
 
         # {1: 4, 1: 4, 3: 5, -1: k}: kty twice.
         with pytest.raises(cbor2.CBORDecodeError):
-            EncryptedCOSEKey.to_cose_key(encrypt(b"\xa4" + dumps(1) + dumps(4) + dumps(1) + dumps(4) + rest), enc_key)
+            EncryptedCOSEKey.to_cose_key(
+                encrypt(b"\xa4" + dumps(1) + dumps(4) + dumps(1) + dumps(4) + rest),
+                enc_key,
+                context=context,
+            )
             pytest.fail("to_cose_key() should fail.")
 
     def test_recipient_from_list_with_duplicated_protected_header_label(self):

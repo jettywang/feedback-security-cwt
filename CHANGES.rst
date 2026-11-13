@@ -4,6 +4,12 @@ Changes
 Unreleased
 ----------
 
+- Harden ``EncryptedCOSEKey`` so an encrypted COSE key cannot be moved onto another business link:
+    - **Breaking change**: ``EncryptedCOSEKey.from_cose_key()`` now requires an authenticated ``context`` (built by the new ``EncryptedCOSEKey.build_context(purpose, recipient_context)``) which is authenticated as the external AAD of the COSE_Encrypt0 envelope. A different protocol purpose or recipient context makes AEAD verification fail on decryption.
+    - ``EncryptedCOSEKey.to_cose_key()`` now takes the matching ``context`` plus optional caller-policy arguments ``alg`` and ``key_ops``; the recovered (wrapped) key is rejected with ``VerifyError`` if its algorithm or key operations do not satisfy the policy. These checks target the wrapped key, distinct from the wrapping ``encryption_key`` permissions.
+    - Old envelopes without an authenticated context must be opened explicitly with ``legacy=True``. A context-bound envelope whose verification fails never falls back to the legacy behavior, and ``legacy`` cannot be combined with a ``context``.
+    - Reject an ``encryption_key`` whose ``key_ops`` does not permit ``encrypt`` (3) on wrapping or ``decrypt`` (4) on unwrapping.
+
 Version 4.0.0
 -------------
 

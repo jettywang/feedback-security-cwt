@@ -27,6 +27,7 @@ from cwt.enums import (
     COSEAlgs,
     COSEKeyConfirmationMethods,
     COSEKeyCrvs,
+    COSEKeyOps,
     COSEKeyParams,
     COSEKeyTypes,
     HCertClaims,
@@ -521,6 +522,7 @@ class TestSample:
             "a-client-secret-of-cwt-presenter",
             alg="HMAC 256/256",
         )
+        context = EncryptedCOSEKey.build_context("cnf/eck", "presenter-01")
         token = cwt.encode(
             {
                 "iss": "coaps://as.example",
@@ -528,7 +530,7 @@ class TestSample:
                 "cti": "123",
                 "cnf": {
                     # 'eck'(Encrypted Cose Key) is a keyword defined by this library.
-                    "eck": EncryptedCOSEKey.from_cose_key(pop_key, enc_key),
+                    "eck": EncryptedCOSEKey.from_cose_key(pop_key, enc_key, context),
                 },
             },
             private_key,
@@ -542,7 +544,9 @@ class TestSample:
             decoded[CWTClaims.CNF][COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY], list
         )
         c = Claims.new(decoded)
-        extracted = EncryptedCOSEKey.to_cose_key(c.cnf, enc_key)
+        extracted = EncryptedCOSEKey.to_cose_key(
+            c.cnf, enc_key, context=context, alg="HMAC 256/256", key_ops=["MAC create", "MAC verify"]
+        )
         assert extracted.kty == COSEKeyTypes.ASYMMETRIC  # Symmetric
         assert extracted.alg == COSEAlgs.HS256  # HMAC 256/256
         assert extracted.key == b"a-client-secret-of-cwt-presenter"
@@ -614,13 +618,14 @@ class TestSample:
             "a-client-secret-of-cwt-presenter",
             alg="HMAC 256/256",
         )
+        context = EncryptedCOSEKey.build_context("cnf/eck", "presenter-01")
         token = cwt.encode(
             {
                 CWTClaims.ISS: "coaps://as.example",  # iss
                 CWTClaims.SUB: "dajiaji",  # sub
                 CWTClaims.CTI: b"123",  # cti
                 CWTClaims.CNF: {  # cnf
-                    COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY: EncryptedCOSEKey.from_cose_key(pop_key, enc_key),
+                    COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY: EncryptedCOSEKey.from_cose_key(pop_key, enc_key, context),
                 },
             },
             private_key,
@@ -633,7 +638,13 @@ class TestSample:
         assert COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY in decoded[CWTClaims.CNF] and isinstance(
             decoded[CWTClaims.CNF][COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY], list
         )
-        extracted = EncryptedCOSEKey.to_cose_key(decoded[CWTClaims.CNF][COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY], enc_key)
+        extracted = EncryptedCOSEKey.to_cose_key(
+            decoded[CWTClaims.CNF][COSEKeyConfirmationMethods.ENCRYPTED_COSE_KEY],
+            enc_key,
+            context=context,
+            alg=COSEAlgs.HS256,
+            key_ops=[COSEKeyOps.MAC_CREATE, COSEKeyOps.MAC_VERIFY],
+        )
         assert extracted.kty == COSEKeyTypes.ASYMMETRIC  # Symmetric
         assert extracted.alg == COSEAlgs.HS256  # HMAC 256/256
         assert extracted.key == b"a-client-secret-of-cwt-presenter"
