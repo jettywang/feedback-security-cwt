@@ -12,10 +12,11 @@ import cbor2
 import pytest
 
 from cwt import COSE, COSEKey, Recipient
-from cwt.enums import COSEAlgs, COSEHeaders
+from cwt.enums import COSEAlgs, COSEHeaders, COSEKeyOps
 from cwt.exceptions import DecodeError
 from cwt.recipient_interface import RecipientInterface
 from cwt.recipients import Recipients
+from cwt.utils import to_mutable
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1064,3 +1065,224 @@ class TestRecipients:
         )
         recipient = COSE.new()
         assert b"Hello world!" == recipient.decode(encoded, rsk2, context, enable_non_aead=True)
+
+
+def _corrupt_first_recipient(encoded: bytes) -> bytes:
+    tagged = cbor2.loads(encoded)
+    value = to_mutable(tagged.value)
+    ciphertext = bytearray(value[3][0][2])
+    ciphertext[0] ^= 0xFF
+    value[3][0][2] = bytes(ciphertext)
+    return cbor2.dumps(cbor2.CBORTag(tagged.tag, value))
+
+
+def _reverse_recipients(encoded: bytes) -> bytes:
+    tagged = cbor2.loads(encoded)
+    value = to_mutable(tagged.value)
+    value[3] = list(reversed(value[3]))
+    return cbor2.dumps(cbor2.CBORTag(tagged.tag, value))
+
+
+class TestRecipientsMultiCandidate:
+    """
+    Tests for candidate handling across multiple recipients, including
+    ordering stability, key purpose/alg constraints, nested key wrap and
+    the separation of "no suitable key" from authentication failures.
+    """
+
+    def test_encrypt_decrypt_is_stable_across_key_and_recipient_order(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        kw_a = COSEKey.from_symmetric_key(alg="A128KW", kid="a")
+        kw_b = COSEKey.from_symmetric_key(alg="A256KW", kid="b")
+        rec_a = Recipient.new(unprotected={"alg": "A128KW", "kid": b"a"}, sender_key=kw_a)
+        rec_b = Recipient.new(unprotected={"alg": "A256KW", "kid": b"b"}, sender_key=kw_b)
+
+        encoded = sender.encode_and_encrypt(b"stable content", cek, recipients=[rec_a, rec_b])
+
+        key_orders = [[kw_a, kw_b], [kw_b, kw_a]]
+        message_orders = [encoded, _reverse_recipients(encoded)]
+        for message in message_orders:
+            for keys in key_orders:
+                assert COSE.new().decode(message, keys) == b"stable content"
+
+    def test_same_kid_wrong_purpose_key_never_gets_an_attempt(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        wrap_key = COSEKey.from_symmetric_key(
+            alg="A128KW",
+            kid="shared",
+            key_ops=[COSEKeyOps.WRAP_KEY, COSEKeyOps.UNWRAP_KEY],
+        )
+        # Same kid, but an AEAD content key limited to encrypt/decrypt: it must
+        # never be selected as an unwrap candidate even when listed first.
+        wrong_purpose = COSEKey.from_symmetric_key(
+            alg="A128GCM",
+            kid="shared",
+            key_ops=[COSEKeyOps.ENCRYPT, COSEKeyOps.DECRYPT],
+        )
+        rec = Recipient.new(unprotected={"alg": "A128KW", "kid": b"shared"}, sender_key=wrap_key)
+        encoded = sender.encode_and_encrypt(b"purpose bound", cek, recipients=[rec])
+
+        assert COSE.new().decode(encoded, [wrong_purpose, wrap_key]) == b"purpose bound"
+        assert COSE.new().decode(encoded, [wrap_key, wrong_purpose]) == b"purpose bound"
+
+        with pytest.raises(ValueError) as err:
+            COSE.new().decode(encoded, [wrong_purpose])
+        assert "key is not found." in str(err.value)
+
+    def test_same_kid_wrong_alg_key_is_rejected(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        wrap_key = COSEKey.from_symmetric_key(alg="A128KW", kid="shared")
+        wrong_alg = COSEKey.from_symmetric_key(alg="A256KW", kid="shared")
+        rec = Recipient.new(unprotected={"alg": "A128KW", "kid": b"shared"}, sender_key=wrap_key)
+        encoded = sender.encode_and_encrypt(b"alg bound", cek, recipients=[rec])
+
+        assert COSE.new().decode(encoded, [wrong_alg, wrap_key]) == b"alg bound"
+        with pytest.raises(ValueError) as err:
+            COSE.new().decode(encoded, [wrong_alg])
+        assert "key is not found." in str(err.value)
+
+    def test_corrupted_branch_keeps_other_recipients_working(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        kw_a = COSEKey.from_symmetric_key(alg="A128KW", kid="a")
+        kw_b = COSEKey.from_symmetric_key(alg="A128KW", kid="b")
+        rec_a = Recipient.new(unprotected={"alg": "A128KW", "kid": b"a"}, sender_key=kw_a)
+        rec_b = Recipient.new(unprotected={"alg": "A128KW", "kid": b"b"}, sender_key=kw_b)
+        encoded = sender.encode_and_encrypt(b"resilient content", cek, recipients=[rec_a, rec_b])
+
+        corrupted = _corrupt_first_recipient(encoded)
+        # The corrupt branch (a) is tried first in both orderings; branch state
+        # must not leak into the intact branch (b).
+        assert COSE.new().decode(corrupted, [kw_a, kw_b]) == b"resilient content"
+        assert COSE.new().decode(corrupted, [kw_b, kw_a]) == b"resilient content"
+
+        # With only the corrupt branch's key, this is an authentication/decoding
+        # failure, not a missing-key failure.
+        with pytest.raises(DecodeError) as err:
+            COSE.new().decode(corrupted, [kw_a])
+        assert "Failed to decode key." in str(err.value)
+
+        # With no matching kid at all, it remains a missing-key failure.
+        kw_c = COSEKey.from_symmetric_key(alg="A128KW", kid="c")
+        with pytest.raises(ValueError) as err:
+            COSE.new().decode(corrupted, [kw_c])
+        assert "key is not found." in str(err.value)
+
+    def test_failed_branch_does_not_mutate_later_decryption(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        kw_a = COSEKey.from_symmetric_key(alg="A128KW", kid="a")
+        kw_b = COSEKey.from_symmetric_key(alg="A128KW", kid="b")
+        rec_a = Recipient.new(unprotected={"alg": "A128KW", "kid": b"a"}, sender_key=kw_a)
+        rec_b = Recipient.new(unprotected={"alg": "A128KW", "kid": b"b"}, sender_key=kw_b)
+        encoded = sender.encode_and_encrypt(b"repeatable", cek, recipients=[rec_a, rec_b])
+
+        recipient = COSE.new()
+        keys = [COSEKey.from_symmetric_key(alg="A128KW", kid="unknown"), kw_a, kw_b]
+        # Replaying the same message with the same objects must keep succeeding.
+        for _ in range(3):
+            assert recipient.decode(encoded, keys) == b"repeatable"
+
+    def test_nested_key_wrap_round_trip_with_ordered_key_lists(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        inner_key = COSEKey.from_symmetric_key(alg="A128KW", kid="inner")
+        outer_key = COSEKey.from_symmetric_key(alg="A256KW", kid="outer")
+
+        inner = Recipient.new(unprotected={"alg": "A128KW", "kid": b"inner"}, sender_key=inner_key)
+        outer = Recipient.new(
+            unprotected={"alg": "A256KW", "kid": b"outer"},
+            sender_key=outer_key,
+            recipients=[inner],
+        )
+        encoded = sender.encode_and_encrypt(b"nested content", cek, recipients=[outer])
+
+        # The innermost key unwraps the chain regardless of list ordering.
+        assert COSE.new().decode(encoded, [inner_key]) == b"nested content"
+        # Holding an outer KEK directly also opens that layer.
+        assert COSE.new().decode(encoded, [outer_key, inner_key]) == b"nested content"
+        assert COSE.new().decode(encoded, [inner_key, outer_key]) == b"nested content"
+
+        unrelated = COSEKey.from_symmetric_key(alg="A128KW", kid="other")
+        with pytest.raises(ValueError) as err:
+            COSE.new().decode(encoded, [unrelated])
+        assert "key is not found." in str(err.value)
+
+    def test_three_layer_nested_key_wrap(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        k_inner = COSEKey.from_symmetric_key(alg="A128KW", kid="k-inner")
+        k_middle = COSEKey.from_symmetric_key(alg="A192KW", kid="k-middle")
+        k_outer = COSEKey.from_symmetric_key(alg="A256KW", kid="k-outer")
+
+        inner = Recipient.new(unprotected={"alg": "A128KW", "kid": b"k-inner"}, sender_key=k_inner)
+        middle = Recipient.new(
+            unprotected={"alg": "A192KW", "kid": b"k-middle"},
+            sender_key=k_middle,
+            recipients=[inner],
+        )
+        outer = Recipient.new(
+            unprotected={"alg": "A256KW", "kid": b"k-outer"},
+            sender_key=k_outer,
+            recipients=[middle],
+        )
+        encoded = sender.encode_and_encrypt(b"three layers", cek, recipients=[outer])
+
+        for keys in ([k_inner], [k_middle, k_inner], [k_inner, k_middle], [k_outer]):
+            assert COSE.new().decode(encoded, keys) == b"three layers"
+
+    def test_nested_key_wrap_corrupted_inner_branch_diagnostic(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        cek = COSEKey.from_symmetric_key(alg="A128GCM")
+        inner_key = COSEKey.from_symmetric_key(alg="A128KW", kid="inner")
+        outer_key = COSEKey.from_symmetric_key(alg="A256KW", kid="outer")
+
+        inner = Recipient.new(unprotected={"alg": "A128KW", "kid": b"inner"}, sender_key=inner_key)
+        outer = Recipient.new(
+            unprotected={"alg": "A256KW", "kid": b"outer"},
+            sender_key=outer_key,
+            recipients=[inner],
+        )
+        encoded = sender.encode_and_encrypt(b"nested corrupt", cek, recipients=[outer])
+
+        # Corrupt the inner (child) recipient's wrapped key.
+        tagged = cbor2.loads(encoded)
+        value = to_mutable(tagged.value)
+        child_ct = bytearray(value[3][0][3][0][2])
+        child_ct[0] ^= 0xFF
+        value[3][0][3][0][2] = bytes(child_ct)
+        corrupted = cbor2.dumps(cbor2.CBORTag(tagged.tag, value))
+
+        # The outer KEK still opens the outer layer directly.
+        assert COSE.new().decode(corrupted, [outer_key]) == b"nested corrupt"
+        # Relying only on the corrupted inner branch is a decode failure with
+        # non-sensitive branch diagnostics (alg/kid), not key material.
+        with pytest.raises(DecodeError) as err:
+            COSE.new().decode(corrupted, [inner_key])
+        message = str(err.value)
+        assert "Failed to decode key." in message
+        assert inner_key.key.hex() not in message
+
+    def test_mac_path_respects_purpose_and_ordering(self):
+        sender = COSE.new(alg_auto_inclusion=True)
+        mac_key = COSEKey.from_symmetric_key(alg="HS256")
+        wrap_key = COSEKey.from_symmetric_key(
+            alg="A128KW",
+            kid="m",
+            key_ops=[COSEKeyOps.WRAP_KEY, COSEKeyOps.UNWRAP_KEY],
+        )
+        wrong_purpose = COSEKey.from_symmetric_key(
+            alg="A128GCM",
+            kid="m",
+            key_ops=[COSEKeyOps.ENCRYPT, COSEKeyOps.DECRYPT],
+        )
+        rec = Recipient.new(unprotected={"alg": "A128KW", "kid": b"m"}, sender_key=wrap_key)
+        encoded = sender.encode_and_mac(b"mac content", mac_key, recipients=[rec])
+
+        assert COSE.new().decode(encoded, [wrong_purpose, wrap_key]) == b"mac content"
+        with pytest.raises(ValueError) as err:
+            COSE.new().decode(encoded, [wrong_purpose])
+        assert "key is not found." in str(err.value)

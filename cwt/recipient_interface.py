@@ -83,6 +83,7 @@ class RecipientInterface(CBORProcessor):
 
         # Validate recipients
         self._recipients: list[RecipientInterface] = []
+        self._nested_encoded: list[list[Any]] | None = None
         if not recipients:
             return
         for recipient in recipients:
@@ -143,6 +144,22 @@ class RecipientInterface(CBORProcessor):
         return self._recipients
 
     @property
+    def key(self) -> bytes:
+        """
+        The raw key material held by the recipient (e.g. a key-encryption key
+        to be wrapped by a nested recipient).
+        """
+        return self._key
+
+    def _set_nested_recipients(self, recipients: list[list[Any]]) -> None:
+        """
+        Replaces the nested recipient structures with their encoded form after
+        a recursive encode pass.
+        """
+        self._nested_encoded = recipients
+        return
+
+    @property
     def context(self) -> list[Any]:
         """
         The recipient context information.
@@ -160,6 +177,11 @@ class RecipientInterface(CBORProcessor):
         b_ciphertext = self._ciphertext if self._ciphertext else b""
         res: list[Any] = [b_protected, self._unprotected, b_ciphertext]
         if not self._recipients:
+            return res
+
+        nested = self._nested_encoded
+        if nested is not None:
+            res.append(nested)
             return res
 
         children = []

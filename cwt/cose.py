@@ -418,7 +418,9 @@ class COSE(CBORProcessor):
             if not isinstance(data.value, (list, tuple)) or len(data.value) != 3:
                 raise ValueError("Invalid Encrypt0 format.")
         elif data.tag == 96:
-            keys = self._filter_by_key_ops(keys, 4)
+            # COSE_Encrypt recipient keys are wrapping/agreement keys, not content
+            # decrypt keys; key_ops/alg suitability is enforced per recipient in
+            # Recipients.derive_key instead of a coarse prefilter here.
             if not isinstance(data.value, (list, tuple)) or len(data.value) != 4:
                 raise ValueError("Invalid Encrypt format.")
         elif data.tag == 17:
@@ -426,7 +428,8 @@ class COSE(CBORProcessor):
             if not isinstance(data.value, (list, tuple)) or len(data.value) != 4:
                 raise ValueError("Invalid MAC0 format.")
         elif data.tag == 97:
-            keys = self._filter_by_key_ops(keys, 10)
+            # See the COSE_Encrypt note above: MAC recipient keys are handled
+            # per recipient rather than filtered against the MAC verify op.
             if not isinstance(data.value, (list, tuple)) or len(data.value) != 5:
                 raise ValueError("Invalid MAC format.")
         elif data.tag == 18:
@@ -833,16 +836,12 @@ class COSE(CBORProcessor):
             raise NotImplementedError("Algorithms other than direct are not supported for recipients.")
 
         content_alg = p.get(1, 0) or u.get(1, 0)
-        recs = []
         b_key = key.to_bytes() if isinstance(key, COSEKeyInterface) else b""
-        cek: COSEKeyInterface | None = None
         for rec in recipients:
             if isinstance(rec, HPKE):
                 rec.content_alg = content_alg
-            aad = self._dumps(["Enc_Recipient", self._dumps(rec.protected) if len(rec.protected) > 0 else b"", external_aad])
-            encoded, derived_key = rec.encode(b_key, aad)
-            cek = derived_key if derived_key else key
-            recs.append(encoded)
+        recs, derived = Recipients(recipients).encode(b_key, external_aad, "Enc_Recipient")
+        cek = derived if derived is not None else key
 
         if cek is None:
             raise ValueError("key should be set.")
@@ -887,15 +886,12 @@ class COSE(CBORProcessor):
         mac_structure = ["MAC", b_protected, external_aad, payload]
 
         content_alg = p.get(1, 0) or u.get(1, 0)
-        recs = []
         b_key = key.to_bytes() if isinstance(key, COSEKeyInterface) else b""
         for rec in recipients:
             if isinstance(rec, HPKE):
                 rec.content_alg = content_alg
-            aad = self._dumps(["Mac_Recipient", self._dumps(rec.protected), external_aad])
-            encoded, derived_key = rec.encode(b_key, aad)
-            key = derived_key if derived_key else key
-            recs.append(encoded)
+        recs, derived = Recipients(recipients).encode(b_key, external_aad, "Mac_Recipient")
+        key = derived if derived is not None else key
 
         if key is None:
             raise ValueError("key should be set.")
