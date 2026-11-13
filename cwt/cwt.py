@@ -328,12 +328,16 @@ class CWT(CBORProcessor):
         value of each claim in it must be identical (as a CBOR data item) to the
         corresponding claim in the payload, if present.
 
+        ``no_verify`` only skips these claim checks and the ``exp``/``nbf``
+        validation. The COSE layers are still decrypted and authenticated with
+        the supplied keys.
+
         Args:
             data (bytes): A byte string of an encoded CWT.
             keys (COSEKeyInterface | list[COSEKeyInterface]): A COSE key
                 or a list of the keys used to verify and decrypt the encoded CWT.
-            no_verify (bool): An indicator whether token verification is skiped
-                or not.
+            no_verify (bool): An indicator whether to skip the claims/``exp``/
+                ``nbf`` checks or not. It does not disable COSE cryptography.
         Returns:
             dict[int, Any] | bytes: A byte string of the decoded CWT.
         Raises:
@@ -443,18 +447,30 @@ class CWT(CBORProcessor):
     ):
         # RFC 9597 Section 2
         label = COSEHeaders.CWT_CLAIMS
-        if label in protected and label in unprotected:
+        encoded_label = dumps(label, canonical=True)
+        header_values: list[tuple[str, Any]] = []
+        for where, header in (("protected", protected), ("unprotected", unprotected)):
+            for k, v in header.items():
+                # Match the header label as a CBOR data item as well: 15.0 is not the label 15.
+                if dumps(k, canonical=True) == encoded_label:
+                    header_values.append((where, v))
+                    break
+        if len(header_values) > 1:
             raise ValueError(
                 f"The CWT Claims header parameter({label}) must occur only once in either the protected or unprotected header."
             )
-        for where, header in (("protected", protected), ("unprotected", unprotected)):
-            if label not in header:
-                continue
-            if not isinstance(header[label], Mapping):
+        # Match claim labels by their CBOR encoding: Python dict membership would treat
+        # True as 1 and 1.0 as 1, but they are distinct CBOR data items (RFC 8949 Section 3.1).
+        payload_labels = {dumps(claim, canonical=True): claim for claim in claims}
+        for where, value in header_values:
+            if not isinstance(value, Mapping):
                 raise ValueError(f"The CWT Claims header parameter({label}) should be map.")
-            for k, v in header[label].items():
+            for k, v in value.items():
+                encoded_claim = dumps(k, canonical=True)
+                if encoded_claim not in payload_labels:
+                    continue
                 # Compare deterministic CBOR encodings so that e.g. 1, 1.0 and True are not identical.
-                if k in claims and dumps(claims[k], canonical=True) != dumps(v, canonical=True):
+                if dumps(claims[payload_labels[encoded_claim]], canonical=True) != dumps(v, canonical=True):
                     raise VerifyError(f"The CWT claim({k}) value in {where} header does not match the values in the payload.")
         return
 

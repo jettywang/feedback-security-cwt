@@ -1573,11 +1573,20 @@ by `cwt.decode()` and should be re-issued with `15`.
 
 If a CWT has a CWT Claims header parameter in the protected or unprotected header of any of its COSE layers
 (including the outer layers of a nested CWT), `cwt.decode()` checks that the value of each claim in that parameter is
-identical to the value of the corresponding claim in the payload, if present. Values are compared as CBOR data items,
-so, for example, `1`, `1.0` and `True` are not identical, while map key order does not matter. If they do not match, `VerifyError` is raised.
+identical to the value of the corresponding claim in the payload, if present. Claim labels are matched as CBOR data
+items too, so a header claim labelled `True` or `1.0` is not the payload claim labelled `1`. Values are compared as CBOR
+data items, so, for example, `1`, `1.0` and `True` are not identical, while map key order does not matter. If they do not
+match, `VerifyError` is raised.
 `ValueError` is raised if the parameter value is not a map or if the parameter occurs in both the protected and
 unprotected headers. These checks are skipped if `no_verify=True` is specified. Headers of individual signers
-(`COSE_Signature`) and recipients (`COSE_recipient`) are not checked.
+(`COSE_Signature`) and recipients (`COSE_recipient`) are not checked. Claims that are only in a header, with no
+corresponding claim in the payload, are not copied into the decoded claims and are not compared.
+
+`no_verify=True` skips the claim checks described in this section (and `exp`/`nbf` validation); it does not skip COSE
+cryptography. Each COSE layer is still decrypted/authenticated with the supplied keys, and a wrong encryption or
+signature key fails with `DecodeError`/`VerifyError`. The claim checks run after the layers have been authenticated, so
+`VerifyError` for a mismatching claim means the message was cryptographically valid but its headers are inconsistent with
+the payload.
 
 See [RFC9597 Sections 2–4](https://www.rfc-editor.org/rfc/rfc9597.html#section-2) for recommendations on placing the
 parameter in the protected header, privacy, and security considerations.

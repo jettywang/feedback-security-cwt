@@ -4,6 +4,9 @@ Changes
 Unreleased
 ----------
 
+- Fix the RFC 9597 CWT Claims header check to match claim labels as CBOR data items, not as Python dict keys. A header claim labelled ``True`` or ``1.0`` is no longer treated as the payload claim labelled ``1``. The check applies to the protected and unprotected headers of every COSE layer of a nested CWT.
+- Clarify that ``CWT.decode(..., no_verify=True)`` skips only the claims and ``exp``/``nbf`` checks; COSE decryption and signature verification still happen.
+
 Version 4.0.0
 -------------
 

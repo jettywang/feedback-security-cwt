@@ -828,3 +828,258 @@ class TestCWT:
             ctx.decode(token, [enc_key, mac_key])
             pytest.fail("decode should fail.")
         assert f"The CWT claim({CWTClaims.ISS}) value in protected header does not match" in str(err.value)
+
+
+NESTED_INNER_CLAIM = -70001
+NESTED_OUTER_CLAIM = -70002
+
+
+@pytest.fixture(scope="module")
+def nested_cose():
+    return COSE.new(alg_auto_inclusion=True, kid_auto_inclusion=True)
+
+
+@pytest.fixture(scope="module")
+def nested_sign_key():
+    with open(key_path("private_key_es256.pem")) as key_file:
+        return COSEKey.from_pem(key_file.read(), kid="inner")
+
+
+@pytest.fixture(scope="module")
+def nested_verify_key():
+    with open(key_path("public_key_es256.pem")) as key_file:
+        return COSEKey.from_pem(key_file.read(), kid="inner")
+
+
+@pytest.fixture(scope="module")
+def nested_enc_key():
+    return COSEKey.from_symmetric_key(alg="A128GCM", kid="outer")
+
+
+class TestNestedCWTClaimsHeaderTypes:
+    """
+    Cross-layer regressions for RFC 9597 CWT Claims headers in a signed-then-encrypted CWT.
+
+    The messages here are real COSE_Sign1 (ES256) payloads wrapped in a real COSE_Encrypt0
+    (A128GCM) layer, so a rejection proves the claim check ran on an authenticated message.
+    """
+
+    def _nested(self, cose, sign_key, enc_key, payload, inner_p=None, inner_u=None, outer_p=None, outer_u=None):
+        encoded = dumps(payload)
+        inner = cose.encode_and_sign(encoded, sign_key, inner_p or {}, inner_u or {})
+        return encoded, inner, cose.encode_and_encrypt(inner, enc_key, outer_p or {}, outer_u or {})
+
+    @pytest.mark.parametrize(
+        "header_key, kwarg, where, claim",
+        [
+            (NESTED_INNER_CLAIM, "inner_p", "protected", NESTED_INNER_CLAIM),
+            (NESTED_INNER_CLAIM, "inner_u", "unprotected", NESTED_INNER_CLAIM),
+            (NESTED_OUTER_CLAIM, "outer_p", "protected", NESTED_OUTER_CLAIM),
+            (NESTED_OUTER_CLAIM, "outer_u", "unprotected", NESTED_OUTER_CLAIM),
+        ],
+    )
+    @pytest.mark.parametrize("header_value", [True, 1.0])
+    def test_nested_claim_header_type_confusion_is_rejected_at_its_layer(
+        self,
+        ctx,
+        nested_cose,
+        nested_sign_key,
+        nested_verify_key,
+        nested_enc_key,
+        header_key,
+        kwarg,
+        where,
+        claim,
+        header_value,
+    ):
+        payload = {NESTED_INNER_CLAIM: 1, NESTED_OUTER_CLAIM: 2}
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            payload,
+            **{kwarg: {COSEHeaders.CWT_CLAIMS: {header_key: header_value}}},
+        )
+        with pytest.raises(VerifyError) as err:
+            ctx.decode(token, [nested_enc_key, nested_verify_key])
+            pytest.fail("decode should fail.")
+        assert (
+            f"The CWT claim({claim}) value in {where} header does not match the values in the payload." in str(err.value)
+        )
+
+    def test_nested_claim_headers_keep_cbor_types_on_match(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        claims = {
+            NESTED_INNER_CLAIM: [True, 1, 1.0],
+            NESTED_OUTER_CLAIM: {"bool": True, "int": 1, "float": 1.0, "nested": [[{"k": [False, 0, 0.0]}]]},
+        }
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            claims,
+            inner_p={COSEHeaders.CWT_CLAIMS: {NESTED_INNER_CLAIM: claims[NESTED_INNER_CLAIM]}},
+            outer_u={COSEHeaders.CWT_CLAIMS: {NESTED_OUTER_CLAIM: claims[NESTED_OUTER_CLAIM]}},
+        )
+        decoded = ctx.decode(token, [nested_enc_key, nested_verify_key])
+        assert decoded[NESTED_INNER_CLAIM] == [True, 1, 1.0]
+        assert [type(v) for v in decoded[NESTED_INNER_CLAIM]] == [bool, int, float]
+        assert decoded[NESTED_OUTER_CLAIM]["nested"] == [[{"k": [False, 0, 0.0]}]]
+        assert type(decoded[NESTED_OUTER_CLAIM]["nested"][0][0]["k"][0]) is bool
+
+    @pytest.mark.parametrize(
+        "header_value",
+        [
+            [1, 2],  # [True, 2] reversed types
+            {"a": {"b": [1.0]}},  # nested map with float instead of int
+        ],
+    )
+    def test_nested_claim_header_nested_containers_preserve_types(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key, header_value
+    ):
+        payload = {
+            NESTED_INNER_CLAIM: [True, 2],
+            NESTED_OUTER_CLAIM: {"a": {"b": [1]}},
+        }
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            payload,
+            outer_p={COSEHeaders.CWT_CLAIMS: {NESTED_OUTER_CLAIM: header_value}},
+        )
+        with pytest.raises(VerifyError) as err:
+            ctx.decode(token, [nested_enc_key, nested_verify_key])
+            pytest.fail("decode should fail.")
+        assert (
+            f"The CWT claim({NESTED_OUTER_CLAIM}) value in protected header does not match the values in the payload."
+            in str(err.value)
+        )
+
+    def test_nested_claim_headers_map_key_order_is_irrelevant(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        payload = {NESTED_OUTER_CLAIM: {"b": [1, True], "a": {"d": 1.0, "c": 2}}}
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            payload,
+            outer_p={COSEHeaders.CWT_CLAIMS: {NESTED_OUTER_CLAIM: {"a": {"c": 2, "d": 1.0}, "b": [1, True]}}},
+        )
+        assert ctx.decode(token, [nested_enc_key, nested_verify_key])[NESTED_OUTER_CLAIM] == payload[NESTED_OUTER_CLAIM]
+
+    @pytest.mark.parametrize("protected", [True, False])
+    def test_nested_claim_absent_from_payload_is_ignored(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key, protected
+    ):
+        payload = {CWTClaims.ISS: "https://as.example"}
+        hdr = {COSEHeaders.CWT_CLAIMS: {CWTClaims.SUB: "only-in-header", -70003: [True, 1.0]}}
+        if protected:
+            _, _, token = self._nested(nested_cose, nested_sign_key, nested_enc_key, payload, outer_p=hdr)
+        else:
+            _, _, token = self._nested(nested_cose, nested_sign_key, nested_enc_key, payload, outer_u=hdr)
+        decoded = ctx.decode(token, [nested_enc_key, nested_verify_key])
+        assert CWTClaims.SUB not in decoded
+        assert -70003 not in decoded
+
+    def test_nested_claim_label_types_are_not_conflated(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        # The header labels True and 1.0 are distinct CBOR data items from the payload label 1.
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            {1: "https://as.example"},
+            inner_p={COSEHeaders.CWT_CLAIMS: {True: "https://asx.example"}},
+            outer_p={COSEHeaders.CWT_CLAIMS: {1.0: "https://asx.example"}},
+        )
+        assert ctx.decode(token, [nested_enc_key, nested_verify_key])[1] == "https://as.example"
+
+    def test_nested_claim_header_label_types_are_not_conflated(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        # The header label 15.0 is not the CWT Claims label 15, so its map is not compared.
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            {1: "https://as.example"},
+            outer_p={15.0: {1: "https://asx.example"}},
+        )
+        assert ctx.decode(token, [nested_enc_key, nested_verify_key])[1] == "https://as.example"
+
+    def test_nested_claim_headers_do_not_rewrite_protected_encoding(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        claims = {NESTED_INNER_CLAIM: [1, {"a": True}], NESTED_OUTER_CLAIM: {"x": [1.0, {2: b"v"}]}}
+        _, encoded_inner, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            claims,
+            inner_p={COSEHeaders.CWT_CLAIMS: {NESTED_INNER_CLAIM: [1, {"a": True}]}},
+            outer_p={COSEHeaders.CWT_CLAIMS: {NESTED_OUTER_CLAIM: {"x": [1.0, {2: b"v"}]}}},
+        )
+        outer = cbor2.loads(token)
+        outer_protected = outer.value[0]
+        # The library writes the header map as given, not in canonical order.
+        assert outer_protected != dumps(cbor2.loads(outer_protected), canonical=True)
+        assert outer_protected in token
+
+        inner = cbor2.loads(nested_cose.decode(token, nested_enc_key))
+        assert inner.tag == 18
+        inner_protected = cbor2.loads(encoded_inner).value[0]
+        assert inner_protected != dumps(cbor2.loads(inner_protected), canonical=True)
+        # Decryption hands back the inner message with its original protected bytes.
+        assert inner.value[0] == inner_protected
+        # The ES256 signature is over the original protected bytes and still verifies.
+        nested_verify_key.verify(dumps(["Signature1", inner_protected, b"", inner.value[2]]), inner.value[3])
+
+        assert ctx.decode(token, [nested_enc_key, nested_verify_key]) == claims
+
+    def test_nested_claim_duplicate_map_keys_are_rejected_before_verification(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        # {15: {-70001: 1, -70001: 2}, 1: 1}: the claim label appears twice in the outer protected header.
+        duplicate_claims = b"\xa2" + dumps(NESTED_INNER_CLAIM) + dumps(1) + dumps(NESTED_INNER_CLAIM) + dumps(2)
+        raw_protected = b"\xa2" + dumps(COSEHeaders.CWT_CLAIMS) + duplicate_claims + dumps(COSEHeaders.ALG) + dumps(1)
+        nonce = nested_enc_key.generate_nonce()
+        payload = dumps({NESTED_INNER_CLAIM: 1})
+        inner = nested_cose.encode_and_sign(payload, nested_sign_key)
+        ciphertext = nested_enc_key.encrypt(inner, nonce, dumps(["Encrypt0", raw_protected, b""]))
+        token = dumps(CBORTag(16, [raw_protected, {COSEHeaders.KID: b"outer", COSEHeaders.IV: nonce}, ciphertext]))
+
+        for no_verify in (False, True):
+            with pytest.raises(DecodeError) as err:
+                ctx.decode(token, [nested_enc_key, nested_verify_key], no_verify)
+                pytest.fail("decode should fail.")
+            assert "Failed to decode." in str(err.value)
+            assert isinstance(err.value.__cause__, cbor2.CBORDecodeError)
+
+    def test_nested_claim_no_verify_skips_claim_checks_only(
+        self, ctx, nested_cose, nested_sign_key, nested_verify_key, nested_enc_key
+    ):
+        _, _, token = self._nested(
+            nested_cose,
+            nested_sign_key,
+            nested_enc_key,
+            {CWTClaims.ISS: "https://as.example"},
+            outer_p={COSEHeaders.CWT_CLAIMS: {CWTClaims.ISS: "https://asx.example"}},
+        )
+        with pytest.raises(VerifyError):
+            ctx.decode(token, [nested_enc_key, nested_verify_key])
+
+        # no_verify skips the exp/nbf and CWT Claims header checks, not the COSE cryptography.
+        assert ctx.decode(token, [nested_enc_key, nested_verify_key], no_verify=True)[CWTClaims.ISS] == "https://as.example"
+        with pytest.raises(DecodeError) as err:
+            ctx.decode(token, [COSEKey.from_symmetric_key(alg="A128GCM", kid="outer"), nested_verify_key], no_verify=True)
+            pytest.fail("decode should fail.")
+        assert "Failed to decrypt." in str(err.value)
+
+        wrong_sign_key = COSEKey.from_symmetric_key(alg="HS256", kid="inner")
+        with pytest.raises(VerifyError):
+            ctx.decode(token, [nested_enc_key, wrong_sign_key], no_verify=True)
+
