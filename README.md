@@ -615,6 +615,54 @@ recipient = COSE.new()
 assert b"Hello world!" == recipient.decode(encoded, enc_key)
 ```
 
+#### Encryption with a Partial IV and a Base IV
+
+When many messages are protected with the same key, you can store a long-lived
+Base IV in the COSE key (`COSEKeyParams.BASE_IV`, label 5) and send only a short
+Partial IV (`COSEHeaders.PARTIAL_IV`, label 6) in each message. The nonce passed
+to the algorithm is built as defined in
+[RFC 9052, section 5.3](https://www.rfc-editor.org/rfc/rfc9052.html#section-5.3):
+the Partial IV is zero-padded on the left to the length of the Base IV and the two
+are XOR-ed. A full IV (`COSEHeaders.IV`, label 5) is still used as-is and never
+combined with the Base IV.
+
+```py
+from cwt import COSE, COSEKey
+from cwt.enums import COSEHeaders, COSEKeyParams
+
+base_iv = bytes.fromhex("0102030405060708090a0b0c")
+enc_key = COSEKey.new(
+    {
+        COSEKeyParams.KTY: 4,  # Symmetric
+        COSEKeyParams.ALG: 1,  # A128GCM
+        COSEKeyParams.K: bytes(range(16)),
+        COSEKeyParams.BASE_IV: base_iv,
+        COSEKeyParams.KID: b"01",
+    }
+)
+
+# The sender side: the caller assigns a distinct Partial IV per message
+# (e.g. an incrementing counter). The library never generates or reuses one.
+counter = 1
+partial_iv = counter.to_bytes(4, "big")
+sender = COSE.new(alg_auto_inclusion=True)
+encoded = sender.encode(
+    b"Hello world!",
+    enc_key,
+    unprotected={COSEHeaders.PARTIAL_IV: partial_iv},
+)
+
+# The recipient side: the Base IV of the key reconstructs the nonce.
+recipient = COSE.new()
+assert b"Hello world!" == recipient.decode(encoded, enc_key)
+```
+
+Note the security boundary: assigning unique Partial IV values (the counter
+allocation) is the responsibility of the application. Reusing a Partial IV with
+the same key and Base IV reuses the nonce, which breaks the security guarantees
+of the AEAD algorithm. A message that carries a Partial IV requires a key with a
+Base IV; otherwise encoding and decoding raise an error.
+
 #### Countersign (Encrypt0)
 
 `python-cwt` supports [RFC9338: COSE Countersignatures](https://www.rfc-editor.org/rfc/rfc9338.html).

@@ -89,6 +89,10 @@ class ContentEncryptionKey(SymmetricKey):
         if not_acceptable:
             raise ValueError(f"Unknown or not permissible key_ops(4) for ContentEncryptionKey: {not_acceptable[0]}.")
 
+    @property
+    def nonce_length(self) -> int | None:
+        return getattr(self, "_nonce_len", None)
+
 
 class HMACKey(MACAuthenticationKey):
     """ """
@@ -256,6 +260,7 @@ class AESGCMKey(ContentEncryptionKey):
         else:
             raise ValueError(f"Unsupported or unknown alg(3) for AES GCM: {self._alg}.")
 
+        self._nonce_len = _CWT_NONCE_SIZE_AESGCM
         self._cipher = AESGCM(self._key)
         return
 
@@ -289,6 +294,7 @@ class ChaCha20Key(ContentEncryptionKey):
             self._key = ChaCha20Poly1305.generate_key()
         if len(self._key) != 32:
             raise ValueError("The length of ChaCha20/Poly1305 key should be 32 bytes.")
+        self._nonce_len = _CWT_NONCE_SIZE_CHACHA20_POLY1305
         self._cipher = ChaCha20Poly1305(self._key)
         return
 
@@ -385,6 +391,7 @@ class AESCTRKey(ContentEncryptionKey):
         else:
             raise ValueError(f"Unsupported or unknown alg(3) for AES CTR: {self._alg}.")
 
+        self._nonce_len = _CWT_NONCE_SIZE_AES
         self._cipher = AESCTR(self._key)
         return
 
@@ -434,6 +441,7 @@ class AESCBCKey(ContentEncryptionKey):
         else:
             raise ValueError(f"Unsupported or unknown alg(3) for AES CBC: {self._alg}.")
 
+        self._nonce_len = _CWT_NONCE_SIZE_AES
         self._cipher = AESCBC(self._key)
         return
 

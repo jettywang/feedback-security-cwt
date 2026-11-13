@@ -4,6 +4,11 @@ Changes
 Unreleased
 ----------
 
+- Complete support for the Partial IV header parameter (label 6) in COSE Encrypt0 and COSE Encrypt (including multi-recipient messages), per RFC 9052 section 5.3.
+    - Add ``COSEKeyInterface.build_nonce()`` and ``COSEKeyInterface.nonce_length``. A Partial IV is zero-padded on the left to the length of the key's Base IV (label 5) and XOR-ed with it; a full IV (label 5) is still used as-is.
+    - Encoding and decoding now resolve IVs from both the protected and unprotected headers with the same interpretation. A Partial IV without a Base IV, a Partial IV longer than the Base IV, a Base IV whose length does not match the algorithm nonce length, or two IVs in the same security layer raise ``ValueError``.
+    - The library never generates, reuses or defaults a nonce for a Partial IV: assigning distinct Partial IV values (counter allocation) is the caller's responsibility.
+
 Version 4.0.0
 -------------
 

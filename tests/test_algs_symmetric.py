@@ -15,6 +15,7 @@ from cwt.algs.symmetric import (
     HMACKey,
     SymmetricKey,
 )
+from cwt.cose_key import COSEKey
 from cwt.enums import COSEAlgs, COSEKeyOps, COSEKeyParams, COSEKeyTypes
 from cwt.exceptions import DecodeError, EncodeError, VerifyError
 
@@ -1164,3 +1165,31 @@ class TestAESCBCKey:
         decrypted = key.decrypt(encrypted, nonce=invalid_nonce)
         assert encrypted != decrypted
         # as AES-CBC is non-AEAD cipher, integrity and authenticity is not guaranteed
+
+
+class TestContentEncryptionKeyNonceLength:
+    """
+    Tests for the nonce length advertised by content encryption keys.
+    """
+
+    @pytest.mark.parametrize(
+        "alg, expected",
+        [
+            (COSEAlgs.A128GCM, 12),
+            (COSEAlgs.A256GCM, 12),
+            (COSEAlgs.CHACHA20_POLY1305, 12),
+            (COSEAlgs.AES_CCM_16_64_128, 13),
+            (COSEAlgs.AES_CCM_64_64_128, 7),
+            (COSEAlgs.AES_CCM_16_128_128, 13),
+            (COSEAlgs.AES_CCM_64_128_256, 7),
+            (COSEAlgs.A128CTR, 16),
+            (COSEAlgs.A256CBC, 16),
+        ],
+    )
+    def test_nonce_length(self, alg, expected):
+        key = COSEKey.generate_symmetric_key(alg=alg)
+        assert key.nonce_length == expected
+
+    def test_nonce_length_is_none_for_non_content_encryption_keys(self):
+        assert COSEKey.from_symmetric_key(alg="HS256").nonce_length is None
+        assert COSEKey.from_symmetric_key(alg="A128KW").nonce_length is None

@@ -97,6 +97,58 @@ class COSEKeyInterface(CBORProcessor):
         return self._base_iv
 
     @property
+    def nonce_length(self) -> int | None:
+        """
+        The nonce length (in bytes) required by the algorithm of the key,
+        or ``None`` if the key does not perform content encryption.
+        """
+        return None
+
+    def build_nonce(self, iv: bytes | None = None, partial_iv: bytes | None = None) -> bytes:
+        """
+        Builds the nonce to be passed to the underlying AEAD algorithm from
+        the IV header parameters of a COSE message and the Base IV of the key.
+
+        When a full IV (header parameter label 5) is given, it is used as the
+        nonce directly and the Base IV is not consulted. When only a Partial IV
+        (label 6) is given, it is zero-padded on the left to the length of the
+        Base IV and XOR-ed with it, as defined in section 5.3 of RFC 9052.
+
+        The caller is responsible for assigning distinct Partial IV values
+        (e.g. an incrementing counter) for every message protected with the
+        same key. This function never generates, reuses or defaults a nonce
+        on its own.
+
+        Args:
+            iv (bytes | None): The full IV header parameter value, or ``None``.
+            partial_iv (bytes | None): The Partial IV header parameter value,
+                or ``None``.
+        Returns:
+            bytes: The nonce for the algorithm.
+        Raises:
+            ValueError: A Partial IV is given without a Base IV, the Partial IV
+                is longer than the Base IV, both IVs are given, or neither IV
+                is given.
+        """
+        if iv is not None:
+            if partial_iv is not None:
+                raise ValueError("IV and Partial IV must not both be present in the same security layer.")
+            return iv
+        if partial_iv is None:
+            raise ValueError("IV or Partial IV should be set.")
+        if self._base_iv is None:
+            raise ValueError("Partial IV requires a Base IV in the key.")
+        nonce_length = self.nonce_length
+        if nonce_length is not None and len(self._base_iv) != nonce_length:
+            raise ValueError(
+                f"The length of Base IV should be {nonce_length} bytes for the algorithm."
+            )
+        if len(partial_iv) > len(self._base_iv):
+            raise ValueError("Partial IV must not be longer than the Base IV.")
+        padded = b"\x00" * (len(self._base_iv) - len(partial_iv)) + partial_iv
+        return bytes(a ^ b for a, b in zip(self._base_iv, padded))
+
+    @property
     def key(self) -> Any:
         """
         The body of the key. It can be bytes or various PublicKey/PrivateKey objects

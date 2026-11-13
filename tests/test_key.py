@@ -75,6 +75,69 @@ class TestCOSEKeyInterface:
         raw = key.to_dict()
         assert raw[COSEKeyParams.BASE_IV] == b"aabbccddee"
 
+    def test_cose_key_build_nonce_with_full_iv(self):
+        key = COSEKeyInterface(
+            {
+                COSEKeyParams.KTY: COSEKeyTypes.OKP,
+                COSEKeyParams.ALG: COSEAlgs.EDDSA,
+                COSEKeyParams.BASE_IV: b"123456789012",
+            }
+        )
+        # A full IV is used as-is, without consulting the Base IV.
+        assert key.build_nonce(iv=b"abcdefghijkl") == b"abcdefghijkl"
+
+    def test_cose_key_build_nonce_with_partial_iv(self):
+        key = COSEKeyInterface(
+            {
+                COSEKeyParams.KTY: COSEKeyTypes.OKP,
+                COSEKeyParams.ALG: COSEAlgs.EDDSA,
+                COSEKeyParams.BASE_IV: b"123456789012",
+            }
+        )
+        # A Partial IV is zero-padded on the left and XOR-ed with the Base IV.
+        assert key.build_nonce(partial_iv=b"\x00\x00\x00\x09") == b"12345678901;"
+        assert key.build_nonce(partial_iv=b"") == b"123456789012"
+
+    def test_cose_key_build_nonce_without_any_iv(self):
+        key = COSEKeyInterface(
+            {COSEKeyParams.KTY: COSEKeyTypes.OKP, COSEKeyParams.ALG: COSEAlgs.EDDSA}
+        )
+        with pytest.raises(ValueError) as err:
+            key.build_nonce()
+        assert "IV or Partial IV should be set." in str(err.value)
+
+    def test_cose_key_build_nonce_partial_iv_without_base_iv(self):
+        key = COSEKeyInterface(
+            {COSEKeyParams.KTY: COSEKeyTypes.OKP, COSEKeyParams.ALG: COSEAlgs.EDDSA}
+        )
+        with pytest.raises(ValueError) as err:
+            key.build_nonce(partial_iv=b"\x01")
+        assert "Partial IV requires a Base IV in the key." in str(err.value)
+
+    def test_cose_key_build_nonce_with_both_ivs(self):
+        key = COSEKeyInterface(
+            {
+                COSEKeyParams.KTY: COSEKeyTypes.OKP,
+                COSEKeyParams.ALG: COSEAlgs.EDDSA,
+                COSEKeyParams.BASE_IV: b"123456789012",
+            }
+        )
+        with pytest.raises(ValueError) as err:
+            key.build_nonce(iv=b"abcdefghijkl", partial_iv=b"\x01")
+        assert "IV and Partial IV must not both be present" in str(err.value)
+
+    def test_cose_key_build_nonce_with_too_long_partial_iv(self):
+        key = COSEKeyInterface(
+            {
+                COSEKeyParams.KTY: COSEKeyTypes.OKP,
+                COSEKeyParams.ALG: COSEAlgs.EDDSA,
+                COSEKeyParams.BASE_IV: b"123456789012",
+            }
+        )
+        with pytest.raises(ValueError) as err:
+            key.build_nonce(partial_iv=b"\x00" * 13)
+        assert "Partial IV must not be longer than the Base IV." in str(err.value)
+
     def test_cose_key_constructor_without_cose_key(self):
         with pytest.raises(TypeError):
             COSEKeyInterface()

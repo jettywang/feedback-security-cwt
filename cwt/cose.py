@@ -454,6 +454,7 @@ class COSE(CBORProcessor):
         # if not isinstance(unprotected, dict):
         #     raise ValueError("unprotected header should be dict.")
         p, u = self._decode_headers(value[0], value[1])
+        self._validate_iv_headers(p, u)
         alg = p[1] if 1 in p else u.get(1, 0)
         if 1 in u and alg in COSE_ALGORITHMS_HPKE.values():
             raise ValueError("HPKE algorithms must be in the protected header.")
@@ -471,7 +472,6 @@ class COSE(CBORProcessor):
         if data.tag == 16:
             kid = self._get_kid(p, u)
             aad = self._dumps(["Encrypt0", protected, external_aad])
-            nonce = u.get(5, None)
             is_hpke = alg in COSE_ALGORITHMS_HPKE_INTEGRATED.values()
             if kid:
                 for _, k in enumerate(keys):
@@ -484,6 +484,7 @@ class COSE(CBORProcessor):
                             if not isinstance(res, bytes):
                                 raise TypeError("Internal type error.")
                             return p, u, res
+                        nonce = self._resolve_nonce(k, p, u)
                         return p, u, k.decrypt(payload, nonce, aad)
                     except Exception as e:
                         err = e
@@ -496,6 +497,7 @@ class COSE(CBORProcessor):
                         if not isinstance(res, bytes):
                             raise TypeError("Internal type error.")
                         return p, u, res
+                    nonce = self._resolve_nonce(k, p, u)
                     return p, u, k.decrypt(payload, nonce, aad)
                 except Exception as e:
                     err = e
@@ -506,8 +508,8 @@ class COSE(CBORProcessor):
             rs = Recipients.from_list(
                 value[3], self._verify_kid, context, hpke_psk=hpke_psk, extra_info=extra_info, hpke_aad=hpke_aad
             )
-            nonce = u.get(5, b"")
             enc_key = rs.derive_key(keys, alg, external_aad, "Enc_Recipient")
+            nonce = self._resolve_nonce(enc_key, p, u)
             aad = self._dumps(["Encrypt", value[0], external_aad])
             return p, u, enc_key.decrypt(payload, nonce, aad)
 
@@ -819,12 +821,15 @@ class COSE(CBORProcessor):
                 return res if out == "cbor2/CBORTag" else self._dumps(res)
             if key is None:
                 raise ValueError("key should be set.")
-            if 5 not in u:  # nonce
+            if 5 in p or 5 in u or 6 in p or 6 in u:  # IV or Partial IV
+                nonce = self._resolve_nonce(key, p, u)
+            else:
                 try:
                     u[5] = key.generate_nonce()
+                    nonce = u[5]
                 except NotImplementedError:
                     raise ValueError("Nonce generation is not supported for the key. Set a nonce explicitly.")
-            ciphertext = key.encrypt(payload, u[5], aad)
+            ciphertext = key.encrypt(payload, nonce, aad)
             res = CBORTag(16, [b_protected, u, ciphertext])
             return res if out == "cbor2/CBORTag" else self._dumps(res)
 
@@ -846,14 +851,17 @@ class COSE(CBORProcessor):
 
         if cek is None:
             raise ValueError("key should be set.")
-        if 5 not in u:  # nonce
+        if 5 in p or 5 in u or 6 in p or 6 in u:  # IV or Partial IV
+            nonce = self._resolve_nonce(cek, p, u)
+        else:
             try:
                 u[5] = cek.generate_nonce()
+                nonce = u[5]
             except NotImplementedError:
                 raise ValueError("Nonce generation is not supported for the key. Set a nonce explicitly.")
         enc_structure = ["Encrypt", b_protected, external_aad]
         aad = self._dumps(enc_structure)
-        ciphertext = cek.encrypt(payload, u[5], aad)
+        ciphertext = cek.encrypt(payload, nonce, aad)
         cose_enc: list[Any] = [b_protected, u, ciphertext]
         cose_enc.append(recs)
         res = CBORTag(96, cose_enc)
@@ -941,6 +949,53 @@ class COSE(CBORProcessor):
         if len(res) == 0:
             res = keys
         return res
+
+    def _resolve_nonce(
+        self,
+        key: COSEKeyInterface,
+        protected: dict[str | int, Any],
+        unprotected: dict[str | int, Any],
+    ) -> bytes | None:
+        """
+        Resolves the nonce for content encryption from the IV header parameters
+        of a security layer and the (content) key.
+
+        A full IV (label 5) is used as-is. A Partial IV (label 6) is combined
+        with the key's Base IV (see COSEKeyInterface.build_nonce). The mutual
+        exclusivity of the two parameters is already enforced by
+        _validate_cose_message() on encoding and _validate_iv_headers() on
+        decoding.
+        """
+        if 5 in protected:
+            return protected[5]
+        if 5 in unprotected:
+            return unprotected[5]
+        if 6 in protected:
+            return key.build_nonce(partial_iv=protected[6])
+        if 6 in unprotected:
+            return key.build_nonce(partial_iv=unprotected[6])
+        return None
+
+    def _validate_iv_headers(
+        self,
+        protected: dict[str | int, Any],
+        unprotected: dict[str | int, Any],
+    ) -> None:
+        """
+        Validates the IV header parameters (labels 5 and 6) of a decoded
+        security layer: both must be bstr and they must not appear together in
+        the same layer.
+        """
+        iv_count = 0
+        for headers in (protected, unprotected):
+            for label in (5, 6):
+                if label not in headers:
+                    continue
+                if not isinstance(headers[label], bytes):
+                    raise ValueError("IV and Partial IV must be bstr.")
+                iv_count += 1
+        if iv_count > 1:
+            raise ValueError("IV and Partial IV must not both be present in the same security layer.")
 
     def _get_alg(self, protected: Any) -> int:
         return protected[1] if isinstance(protected, Mapping) and 1 in protected else 0
